@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -60,17 +61,13 @@ func taskWorker(t Task) (Task, error) {
 	var err error
 
 	// слишком старые или ошибочные (нулевое время) таски обрабатывать смысла нет
-	if time.Since(t.createdAt) < 20*time.Second {
+	switch {
+	case t.createdAt == time.Time{}: // "ошибки" генерации
+		err = fmt.Errorf("something went wrong")
+	case time.Since(t.createdAt) > 20*time.Second: // "залипшие"
+		err = fmt.Errorf("stale task")
+	default:
 		t.taskResult = "task has been successed"
-	} else {
-		// "ошибки" генерации
-		if (t.createdAt == time.Time{}) {
-			t.taskResult = "something went wrong"
-		} else {
-			// "залипшие"
-			t.taskResult = "stale task"
-		}
-		err = fmt.Errorf("task id %d created at %s, error is \"%s\"", t.id, t.createdAt, t.taskResult)
 	}
 	t.processedAt = time.Now()
 
@@ -80,89 +77,61 @@ func taskWorker(t Task) (Task, error) {
 }
 
 func main() {
-	taskChan := make(chan Task, 10)
-	doneTasks := make(chan Task)
-	undoneTasks := make(chan error)
-	// группа сервисный функций
-	serv_wg := errgroup.Group{}
-	// группа обработчиков
-	task_wg := errgroup.Group{}
-	// сколько воркеров запускать
-	task_wg.SetLimit(maxTaskWorkers)
-	result := map[int64]Task{}
-	err := make([]error, 0, 10)
+	var (
+		taskChan = make(chan Task, 10)
+		// группа сервисный функций
+		wg            errgroup.Group
+		done          = make(map[int64]Task)
+		errored       = make([]error, 0, 10)
+		muDone, muErr sync.Mutex
+	)
 
+	// сколько воркеров запускать + 1 генератор
+	wg.SetLimit(maxTaskWorkers + 1)
+
+	// создание тасков
 	// задаём время работы генератора тасков
 	ctx, cancel := context.WithTimeout(context.Background(), generatorTimeout)
 	defer cancel()
-
-	// создание тасков
-	serv_wg.Go(func() error {
+	wg.Go(func() error {
 		taskCreator(ctx, taskChan)
 		// сообщаем обработчикам, что работы больше нет
 		close(taskChan)
 		return nil
 	})
 
-	// получение результатов
-	serv_wg.Go(func() error {
-		for {
-			select {
-			case r, ok := <-doneTasks:
-				if ok {
-					result[r.id] = r
-				} else {
-					// канал закрыт - исключаем его
-					doneTasks = nil
-				}
-			case r, ok := <-undoneTasks:
-				if ok {
-					err = append(err, r)
-				} else {
-					// канал закрыт - исключаем его
-					undoneTasks = nil
-				}
-			}
-			// все результаты собраны
-			if undoneTasks == nil && doneTasks == nil {
-				break
-			}
-		}
-		return nil
-	})
-
 	// обработка тасков
 	for t := range taskChan {
 		t := t
-		task_wg.Go(func() error {
+		wg.Go(func() error {
 			res, err := taskWorker(t)
-			// Можно писать в каналы или сразу заполнять нужные слайсы - всё одно мьютексы, явные или неявные
+			// Можно писать в каналы или сразу заполнять нужные слайсы - всё одно мьютексы, явные или неявные, но канал сильно медленнее
 			if err != nil {
-				undoneTasks <- err
+				// заполнять результат внутри задачи смысла нет - он не используется
+				// t.taskResult = err.Error()
+				muErr.Lock()
+				errored = append(errored, fmt.Errorf("task id %d created at %q, error is %q", res.id, res.createdAt, err))
+				muErr.Unlock()
 			} else {
-				doneTasks <- res
+				muDone.Lock()
+				done[res.id] = res
+				muDone.Unlock()
 			}
 			return nil
 		})
 	}
-	// ждём завершения обработчиков
-	task_wg.Wait()
 
-	// завершаем сбор результатов
-	close(undoneTasks)
-	close(doneTasks)
-
-	// ждём окончания сбора результатов
-	serv_wg.Wait()
+	// ждём завершения горутин, ошибок мы не генерим, потому игнорим
+	_ = wg.Wait()
 
 	// вывод результатов
 	fmt.Println("Errors:")
-	for _, e := range err {
+	for _, e := range errored {
 		fmt.Println(e)
 	}
 
 	fmt.Println("Done tasks:")
-	for r := range result {
+	for r := range done {
 		fmt.Println(r)
 	}
 }
